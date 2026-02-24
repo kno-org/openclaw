@@ -1,0 +1,741 @@
+
+ ▐▛███▜▌   Claude Code v2.1.50
+▝▜█████▛▘  Opus 4.6 · Claude Max
+  ▘▘ ▝▝    ~/projects/openclaw
+
+❯ where and how is the inbound and outbound files handled? 
+
+⏺ Explore(Explore inbound/outbound file handling)
+  ⎿  Done (44 tool uses · 87.2k tokens · 1m 31s)
+  (ctrl+o to expand)
+
+⏺ Here's how inbound and outbound files are handled:
+
+  Inbound Flow
+
+  1. Channel extraction — each channel downloads/extracts attachments
+  differently:
+  - WhatsApp (src/web/inbound/media.ts) — downloads via Baileys'
+  downloadMediaMessage, resolves MIME types
+  - Telegram (src/telegram/bot-message-context.ts) — uses TelegramMediaRef
+  (path, contentType, stickerMetadata) for photos, videos, docs, audio, stickers
+  - Discord (src/discord/monitor/message-utils.ts) — processes file attachments
+  and sticker CDN URLs
+  - Signal (src/signal/monitor/event-handler.ts) — extracts inline attachments
+  from message bodies
+
+  2. Media storage (src/media/store.ts):
+  - Stored under ~/.openclaw/media/inbound/
+  - Filename format: {original}---{uuid}.{ext} (collision prevention)
+  - TTL: 2 minutes, max 5MB per file
+  - downloadToFile() streams HTTP responses to disk with SSRF guard
+
+  3. Message context (src/auto-reply/templating.ts) — attachments populate
+  MsgContext fields: MediaPath, MediaUrl, MediaType (and plural variants for
+  multiple attachments), plus Transcript and MediaUnderstanding results.
+
+  4. Sandbox staging (src/auto-reply/reply/stage-sandbox-media.ts) — copies
+  inbound files into <workspace>/media/inbound/ for agent code access, with path
+   allowlist validation and symlink escape prevention.
+
+  5. Media understanding (src/media-understanding/) — runs vision/audio
+  analysis, generates MediaUnderstandingOutput[] stored in context.
+
+  6. Media note (src/auto-reply/media-note.ts) — generates [media attached: ...]
+   annotations for the agent prompt (skips already-transcribed audio or
+  already-understood media).
+
+  Outbound Flow
+
+  1. Reply payload (src/auto-reply/types.ts):
+  ReplyPayload = {
+    text?: string;
+    mediaUrl?: string;       // single attachment
+    mediaUrls?: string[];    // multiple attachments
+    audioAsVoice?: boolean;  // voice message vs file
+    // ...
+  }
+
+  2. Attachment resolution (src/media/outbound-attachment.ts):
+  - resolveOutboundAttachmentFromUrl() loads media (local path or URL) → saves
+  to disk → returns { path, contentType }
+
+  3. Delivery pipeline (src/infra/outbound/deliver.ts):
+  - deliverOutboundPayloads() orchestrates delivery
+  - Text chunked per channel limits (Telegram 4000, Discord 2000 chars)
+  - Media resolved via resolveOutboundAttachmentFromUrl()
+  - Dispatched through channel-specific outbound adapters
+
+  4. Channel outbound adapters (src/channels/plugins/outbound/):
+  - Each channel implements ChannelOutboundAdapter with sendText(), sendMedia(),
+   sendPayload()
+  - Per-channel implementations in outbound/telegram.ts, outbound/discord.ts,
+  outbound/slack.ts, outbound/whatsapp.ts
+
+  File format support
+
+  ┌─────────────┬──────────┬───────────────────────────────────────┐
+  │    Type     │ Max Size │                 Notes                 │
+  ├─────────────┼──────────┼───────────────────────────────────────┤
+  │ Images      │ 10MB     │ JPEG, PNG, GIF, WebP                  │
+  ├─────────────┼──────────┼───────────────────────────────────────┤
+  │ Files       │ 5MB      │ Text, Markdown, HTML, CSV, JSON, PDF  │
+  ├─────────────┼──────────┼───────────────────────────────────────┤
+  │ PDFs        │ 5MB      │ Max 4 pages, 4M pixels (configurable) │
+  ├─────────────┼──────────┼───────────────────────────────────────┤
+  │ Media store │ 5MB      │ 2-min TTL, ~/.openclaw/media/         │
+  └─────────────┴──────────┴───────────────────────────────────────┘
+
+  The key input file processing logic lives in src/media/input-files.ts
+  (extractImageContentFromSource, extractFileContentFromSource) which handles
+  base64-or-URL → typed content with text extraction for documents.
+
+✻ Churned for 2m 4s
+
+❯ analyse memory storage and indexing 
+
+⏺ Explore(Explore memory storage and indexing)
+  ⎿  Done (35 tool uses · 86.8k tokens · 2m 32s)
+  (ctrl+o to expand)
+
+⏺ Memory Storage & Indexing Architecture
+
+  OpenClaw has a dual-layer memory system: a session persistence layer and a
+  semantic memory index.
+
+  ---
+  1. Session Persistence
+
+  Storage: ~/.openclaw/agents/<agentId>/sessions/
+  - Metadata: sessions.json — tracks all sessions with token counts, model
+  config, origin info, timestamps
+  - Transcripts: <sessionId>.jsonl — line-delimited JSON with {role, content, 
+  parentId} messages
+
+  Session keys (src/routing/session-key.ts) uniquely scope conversations:
+  agent:{agentId}:{channel}:direct:{peerId}          # per-peer DM
+  agent:{agentId}:{channel}:{peerKind}:{peerId}      # group/guild
+  agent:{agentId}:subagent:{nestedKey}                # nested agents
+
+  Lifecycle via gateway (src/gateway/server-methods/sessions.ts):
+  - sessions.list/preview/resolve — query & load
+  - sessions.patch — update model/config
+  - sessions.compact — prune old messages, archive to .archived, preserve
+  parentId chains
+  - sessions.reset/delete — clear or remove entirely
+
+  ---
+  2. Memory Index (Builtin)
+
+  Core: src/memory/manager.ts (~700 LOC) — MemoryIndexManager
+
+  SQLite schema (src/memory/memory-schema.ts):
+
+  ┌─────────────────┬─────────────────────────────────────────────────────┐
+  │      Table      │                       Purpose                       │
+  ├─────────────────┼─────────────────────────────────────────────────────┤
+  │ meta            │ Index metadata (model, provider, chunk config)      │
+  ├─────────────────┼─────────────────────────────────────────────────────┤
+  │ files           │ File tracking (path, hash, mtime, source)           │
+  ├─────────────────┼─────────────────────────────────────────────────────┤
+  │ chunks          │ Text segments (text, embedding vector, line ranges) │
+  ├─────────────────┼─────────────────────────────────────────────────────┤
+  │ chunks_fts      │ FTS5 virtual table for BM25 keyword search          │
+  ├─────────────────┼─────────────────────────────────────────────────────┤
+  │ chunks_vec      │ sqlite-vec extension for vector similarity          │
+  ├─────────────────┼─────────────────────────────────────────────────────┤
+  │ embedding_cache │ Cache by provider/model/content hash                │
+  └─────────────────┴─────────────────────────────────────────────────────┘
+
+  Indexable sources (MemorySource):
+  - "memory" — knowledge base files (MEMORY.md, memory/**/*.md)
+  - "sessions" — conversation transcripts (experimental, requires
+  experimental.sessionMemory: true)
+
+  Chunking: 400 tokens default, 80-token overlap between chunks.
+
+  ---
+  3. Embedding Providers
+
+  src/memory/embeddings.ts supports:
+
+  ┌──────────┬────────────────────────────────────┬──────────────┐
+  │ Provider │               Model                │  Dimensions  │
+  ├──────────┼────────────────────────────────────┼──────────────┤
+  │ OpenAI   │ text-embedding-3-small (default)   │ 1536         │
+  ├──────────┼────────────────────────────────────┼──────────────┤
+  │ Gemini   │ embedding-001                      │ 768          │
+  ├──────────┼────────────────────────────────────┼──────────────┤
+  │ Voyage   │ voyage-4-large                     │ 1024         │
+  ├──────────┼────────────────────────────────────┼──────────────┤
+  │ Mistral  │ mistral-embed                      │ 1024         │
+  ├──────────┼────────────────────────────────────┼──────────────┤
+  │ Local    │ node-llama-cpp                     │ configurable │
+  ├──────────┼────────────────────────────────────┼──────────────┤
+  │ Auto     │ detect from config, fallback chain │ —            │
+  └──────────┴────────────────────────────────────┴──────────────┘
+
+  Batch embedding supported for all providers (src/memory/batch-*.ts) with retry
+   and concurrent queue.
+
+  ---
+  4. Hybrid Search
+
+  src/memory/hybrid.ts — the core retrieval engine:
+
+  1. Keyword search — FTS5 BM25 queries per extracted keyword
+  (src/memory/query-expansion.ts)
+  2. Vector search — embed query → sqlite-vec cosine similarity
+  3. Merge & rank:
+    - Normalize scores to 0–1
+    - Weighted blend: 70% vector / 30% keyword (default)
+    - MMR (Maximal Marginal Relevance) for result diversity
+    - Temporal decay — older chunks score lower (configurable half-life in days)
+    - Dedup by chunk ID
+  4. Filter: min score 0.35, max 6 results (default)
+
+  Returns MemorySearchResult[] with path, startLine/endLine, snippet, score,
+  source.
+
+  ---
+  5. Sync & Incremental Indexing
+
+  Triggers (configurable per-agent):
+  - onSessionStart — sync when agent session begins
+  - onSearch — sync dirty files before each search
+  - watch — filesystem watcher on memory paths
+  - intervalMinutes — periodic full sync
+
+  Session delta tracking (src/memory/manager-sync-ops.ts, ~1200 LOC):
+  - Tracks per-file lastSize, pendingBytes, pendingMessages
+  - Thresholds: 100KB or 50 messages before re-index
+  - Debounced at 5s (SESSION_DIRTY_DEBOUNCE_MS)
+  - Event-driven via src/sessions/transcript-events.ts
+
+  Sync flow: discover files → hash-based delta detection → chunk → embed (check
+  cache first) → store in SQLite + FTS + vector tables.
+
+  ---
+  6. Plugin Extensions
+
+  memory-core (src/extensions/memory-core/) — built-in tools:
+  - memory_search / memory_get — agent-callable tools
+  - CLI: openclaw memory search/list/status
+
+  memory-lancedb (extensions/memory-lancedb/) — optional LanceDB backend:
+  - Auto-recall hook (inject relevant memories pre-response)
+  - Auto-capture hook (extract facts post-conversation)
+  - Tools: memory_recall, memory_store, memory_forget
+  - Categorized: preference, decision, entity, fact
+  - Deduplication at 0.95 similarity threshold
+
+  ---
+  7. Backend Selection
+
+  src/memory/search-manager.ts picks between:
+  1. Builtin (MemoryIndexManager) — SQLite + sqlite-vec, described above
+  2. QMD (QmdMemoryManager) — delegates to external qmd CLI for large-scale
+  knowledge bases
+
+  Both implement MemorySearchManager interface so the rest of the system is
+  backend-agnostic.
+
+✻ Cooked for 2m 20s
+
+❯ any relationship between lanceDB and QmdMemoryManager 
+
+⏺ Explore(Explore QMD and LanceDB relationship)
+  ⎿  Done (22 tool uses · 89.0k tokens · 5m 10s)
+  (ctrl+o to expand)
+
+⏺ No relationship. They are completely independent systems that solve different
+  problems and share no code.
+
+  LanceDB Plugin (extensions/memory-lancedb/)
+
+  - An optional plugin, not a core memory backend
+  - Provides agent-callable tools: memory_recall, memory_store, memory_forget
+  - Uses LanceDB vector DB + OpenAI embeddings (remote API)
+  - Storage: single shared DB at ~/.openclaw/memory/lancedb
+  - Auto-recall hook injects relevant memories pre-response; auto-capture
+  extracts facts post-conversation
+  - Designed for persistent, structured agent memory (facts, preferences,
+  decisions)
+
+  QmdMemoryManager (src/memory/qmd-manager.ts)
+
+  - A core memory backend alternative to the builtin SQLite indexer
+  - qmd is a separate CLI sidecar (installed via bun install -g) that OpenClaw
+  spawns as subprocesses
+  - Uses local embeddings (node-llama-cpp GGUF models), not remote APIs
+  - BM25 + vector search + reranking over markdown files
+  - Per-agent storage: ~/.openclaw/agents/<agentId>/qmd/index.sqlite
+  - Designed for advanced search over knowledge base files
+
+  How they differ
+
+  ┌─────────────┬─────────────────────────────┬───────────────────────────┐
+  │             │       LanceDB Plugin        │        QMD Backend        │
+  ├─────────────┼─────────────────────────────┼───────────────────────────┤
+  │ Type        │ Plugin (addon)              │ Core backend              │
+  ├─────────────┼─────────────────────────────┼───────────────────────────┤
+  │ Config      │ Plugin config               │ memory.backend = "qmd"    │
+  ├─────────────┼─────────────────────────────┼───────────────────────────┤
+  │ Embeddings  │ OpenAI (remote)             │ Local GGUF models         │
+  ├─────────────┼─────────────────────────────┼───────────────────────────┤
+  │ Search      │ Vector-only                 │ BM25 + vector + reranking │
+  ├─────────────┼─────────────────────────────┼───────────────────────────┤
+  │ Data source │ Its own LanceDB store       │ Markdown files on disk    │
+  ├─────────────┼─────────────────────────────┼───────────────────────────┤
+  │ Purpose     │ Store/recall agent memories │ Search knowledge base     │
+  └─────────────┴─────────────────────────────┴───────────────────────────┘
+
+  Selection in src/memory/search-manager.ts
+
+  The backend choice is exclusive — "builtin" (default) or "qmd":
+
+  if (resolved.backend === "qmd" && resolved.qmd) {
+    // QMD with fallback to builtin
+    return new FallbackMemoryManager({ primary: qmd, fallback: builtin });
+  }
+  // Otherwise builtin MemoryIndexManager
+
+  The LanceDB plugin operates outside this selection entirely — it registers its
+   own tools via the plugin system and can coexist with either backend. A user
+  could have the builtin indexer handling memory_search while the LanceDB plugin
+   independently handles memory_store/memory_recall.
+
+✻ Cooked for 5m 42s
+
+❯ when do agent trigger qmd? 
+
+⏺ Searched for 2 patterns, read 3 files (ctrl+o to expand)
+
+⏺ Now let me find where agents actually call QMD (the consumer side —
+  getMemorySearchManager callers and memory_search tool invocations).
+
+⏺ Searched for 2 patterns, read 2 files (ctrl+o to expand)
+
+⏺ Here's how and when agents trigger QMD:
+
+  Trigger Points
+
+  1. Gateway Boot — startGatewayMemoryBackend() 
+  (src/gateway/server-startup-memory.ts)
+
+  At gateway startup, for every agent with memory.backend = "qmd":
+  - Calls getMemorySearchManager() → creates QmdMemoryManager
+  - This runs initialize() which:
+    - Creates XDG dirs, symlinks shared models
+    - Runs ensureCollections() (creates/rebinds qmd collection add entries)
+    - If update.onBoot: true (default): runs qmd update + qmd embed immediately
+    - Starts a periodic interval timer (default every 5 minutes) for ongoing qmd
+   update + qmd embed cycles
+
+  2. Agent Tool Call — memory_search (src/agents/tools/memory-tool.ts)
+
+  When the AI agent calls the memory_search tool during a conversation:
+  1. createMemorySearchTool → getMemorySearchManager() → returns cached
+  QmdMemoryManager (or creates one)
+  2. Calls manager.search(query, { maxResults, minScore, sessionKey })
+  3. Inside search():
+    - Scope check — denied if session doesn't match allowed scope (default:
+  direct chats only, groups denied)
+    - Waits for pending update — if an update is in-flight, waits up to 500ms
+    - Runs qmd search|vsearch|query (or mcporter bridge) against managed
+  collections
+    - Parses results, resolves doc paths via SQLite, diversifies by source,
+  clamps by char budget
+
+  3. Agent Tool Call — memory_get (src/agents/tools/memory-tool.ts)
+
+  When the agent calls memory_get to read a specific file/snippet after
+  searching:
+  - Calls manager.readFile({ relPath, from, lines })
+  - Reads the markdown file directly from disk (no QMD CLI involved)
+
+  4. Manual Sync — openclaw memory sync / gateway sync() call
+
+  - Calls manager.sync() → runUpdate("manual", force)
+  - Forces qmd update + qmd embed
+
+  5. Periodic Background Timer
+
+  Set during initialize() at qmd-manager.ts:279-284:
+  Every update.intervalMs (default 5 min):
+    → exportSessions() (if sessions enabled: JSONL → markdown)
+    → qmd update (re-index changed files)
+    → qmd embed  (re-embed if embedIntervalMs elapsed, default 60 min)
+
+  QMD CLI Commands Triggered
+
+  When: Boot + periodic
+  Command: qmd update
+  Timeout: 120s
+  ────────────────────────────────────────
+  When: Boot + periodic (if vector mode)
+  Command: qmd embed
+  Timeout: 120s
+  ────────────────────────────────────────
+  When: On memory_search
+  Command: qmd search <query> --json -n <limit> -c <collection>
+  Timeout: 4s
+  ────────────────────────────────────────
+  When: On memory_search (vsearch mode)
+  Command: qmd vsearch <query> --json -n <limit>
+  Timeout: 4s
+  ────────────────────────────────────────
+  When: On memory_search (query mode)
+  Command: qmd query <query> --json -n <limit>
+  Timeout: 4s
+  ────────────────────────────────────────
+  When: Collection setup
+  Command: qmd collection add/remove/list
+  Timeout: 30s
+
+  Scope Gating
+
+  QMD search is denied by default for group chats (src/memory/qmd-scope.ts). The
+   default scope config:
+  { "default": "deny", "rules": [{ "action": "allow", "match": { "chatType":
+  "direct" } }] }
+
+  Only direct/DM sessions can trigger QMD searches unless the user explicitly
+  broadens the scope in config.
+
+  Fallback Behavior
+
+  The FallbackMemoryManager in search-manager.ts wraps QMD with automatic
+  failover:
+  - If QMD search throws → marks primary as failed → falls back to builtin
+  MemoryIndexManager
+  - Evicts cache entry so next request retries QMD fresh
+
+✻ Churned for 50s
+
+❯ qmd stands for? 
+
+⏺ Searched for 3 patterns (ctrl+o to expand)
+
+⏺ The codebase doesn't explicitly spell out the acronym, but based on the GitHub
+   repo (github.com/tobi/qmd) and its description as a "local-first search
+  sidecar" that indexes and searches markdown files using queries (BM25 + vector
+   + reranking), it stands for Query Markdown — a tool for querying markdown
+  document collections.
+
+❯ is the file 
+
+⏺ Searched for 1 pattern (ctrl+o to expand)
+
+⏺ Fetch(https://github.com/tobi/qmd)
+  ⎿  Interrupted · What should Claude do instead?
+
+❯ how is it different from MemoryIndexManager 
+
+⏺ Both implement MemorySearchManager, but they differ significantly in
+  architecture:
+
+  Aspect: Execution
+  MemoryIndexManager (src/memory/manager.ts): In-process (same Node runtime)
+  QmdMemoryManager (src/memory/qmd-manager.ts): Out-of-process (spawns qmd CLI
+  as
+    subprocess)
+  ────────────────────────────────────────
+  Aspect: Embedding
+  MemoryIndexManager (src/memory/manager.ts): Remote APIs (OpenAI, Gemini,
+    Voyage, Mistral) or local llama-cpp
+  QmdMemoryManager (src/memory/qmd-manager.ts): Local only (node-llama-cpp GGUF
+    models, managed by qmd)
+  ────────────────────────────────────────
+  Aspect: Vector DB
+  MemoryIndexManager (src/memory/manager.ts): sqlite-vec extension in SQLite
+  QmdMemoryManager (src/memory/qmd-manager.ts): QMD's own SQLite index
+    (index.sqlite)
+  ────────────────────────────────────────
+  Aspect: Text search
+  MemoryIndexManager (src/memory/manager.ts): FTS5 (BM25) built into same SQLite
+
+    DB
+  QmdMemoryManager (src/memory/qmd-manager.ts): QMD's BM25 implementation
+  ────────────────────────────────────────
+  Aspect: Search modes
+  MemoryIndexManager (src/memory/manager.ts): Always hybrid (FTS + vector,
+    configurable weights)
+  QmdMemoryManager (src/memory/qmd-manager.ts): Selectable: search (BM25),
+    vsearch (vector), query (BM25 + vector + reranking)
+  ────────────────────────────────────────
+  Aspect: Chunking
+  MemoryIndexManager (src/memory/manager.ts): OpenClaw chunks files (400 tokens,
+
+    80 overlap)
+  QmdMemoryManager (src/memory/qmd-manager.ts): QMD handles its own chunking
+    internally
+  ────────────────────────────────────────
+  Aspect: Embedding cache
+  MemoryIndexManager (src/memory/manager.ts): embedding_cache table in SQLite
+  QmdMemoryManager (src/memory/qmd-manager.ts): Managed by QMD
+  ────────────────────────────────────────
+  Aspect: Ranking
+  MemoryIndexManager (src/memory/manager.ts): Normalized weighted scores + MMR +
+
+    temporal decay
+  QmdMemoryManager (src/memory/qmd-manager.ts): QMD's native ranking (includes
+    reranking in query mode)
+  ────────────────────────────────────────
+  Aspect: Schema
+  MemoryIndexManager (src/memory/manager.ts): meta, files, chunks, chunks_fts,
+    chunks_vec tables
+  QmdMemoryManager (src/memory/qmd-manager.ts): QMD's documents table (OpenClaw
+    reads it read-only for path resolution)
+  ────────────────────────────────────────
+  Aspect: Session indexing
+  MemoryIndexManager (src/memory/manager.ts): Direct — parses JSONL, chunks,
+    embeds in-process
+  QmdMemoryManager (src/memory/qmd-manager.ts): Indirect — exports JSONL →
+    markdown files → QMD indexes those
+  ────────────────────────────────────────
+  Aspect: Sync
+  MemoryIndexManager (src/memory/manager.ts): File watcher, on-search,
+    on-session-start, interval
+  QmdMemoryManager (src/memory/qmd-manager.ts): qmd update + qmd embed on boot +
+
+    interval (default 5min / 60min)
+  ────────────────────────────────────────
+  Aspect: Fallback
+  MemoryIndexManager (src/memory/manager.ts): None (it is the fallback)
+  QmdMemoryManager (src/memory/qmd-manager.ts): Falls back to MemoryIndexManager
+
+    if QMD fails
+  ────────────────────────────────────────
+  Aspect: Dependencies
+  MemoryIndexManager (src/memory/manager.ts): Needs an embedding API key (unless
+
+    local)
+  QmdMemoryManager (src/memory/qmd-manager.ts): Needs qmd binary on PATH +
+  SQLite
+    with extensions
+  ────────────────────────────────────────
+  Aspect: Cost
+  MemoryIndexManager (src/memory/manager.ts): Remote embedding calls cost money
+  QmdMemoryManager (src/memory/qmd-manager.ts): Fully local, no API costs
+
+  In short: MemoryIndexManager does everything in-process with remote
+  embeddings, while QmdMemoryManager is a thin wrapper that shells out to an
+  external qmd binary which handles indexing, embedding, and retrieval locally.
+  QMD trades setup complexity for zero API cost and adds reranking capabilities.
+
+❯ how to config to use Qmd to replace memory files? 
+
+⏺ Read 1 file (ctrl+o to expand)
+
+⏺ To switch from the builtin memory indexer to QMD, add this to
+  ~/.openclaw/config.json5:
+
+  memory: {
+    backend: "qmd",
+    qmd: {
+      includeDefaultMemory: true,   // still indexes MEMORY.md + memory/*.md
+      searchMode: "search",         // or "vsearch" (vector), "query"
+  (BM25+vector+reranking)
+      update: {
+        interval: "5m",             // re-index every 5 min
+        onBoot: true,               // index on gateway start
+      },
+      limits: {
+        maxResults: 6,
+        timeoutMs: 4000,
+      },
+      // Optional: index extra markdown dirs
+      paths: [
+        { name: "notes", path: "~/notes", pattern: "**/*.md" }
+      ],
+      // Optional: also index past conversations
+      sessions: { enabled: true, retentionDays: 30 },
+    }
+  }
+
+  Prerequisites:
+
+  1. Install the qmd CLI: bun install -g https://github.com/tobi/qmd
+  2. Ensure qmd is on the gateway's PATH
+  3. macOS: brew install sqlite (needs SQLite with extension support)
+
+  Important: QMD doesn't replace the memory markdown files — they remain the
+  source of truth. QMD replaces the search engine that indexes and retrieves
+  from those files. The agent still writes to MEMORY.md and memory/*.md; QMD
+  just handles the memory_search retrieval instead of the builtin
+  SQLite+embeddings indexer.
+
+  If QMD fails or the binary is missing, OpenClaw automatically falls back to
+  the builtin MemoryIndexManager.
+
+❯ lanceDB can totally replace memory files? 
+
+⏺ Searched for 1 pattern, read 2 files (ctrl+o to expand)
+
+⏺ No, LanceDB cannot fully replace memory files. They serve different purposes:
+
+  What LanceDB does
+
+  - Stores structured memory entries (text + category + importance + vector) in
+  its own vector DB at ~/.openclaw/memory/lancedb
+  - Auto-capture: after a conversation, scans user messages for trigger patterns
+   ("remember", "prefer", emails, phone numbers, etc.) and stores up to 3 per
+  conversation
+  - Auto-recall: before agent starts, embeds the user's prompt and injects top-3
+   matching memories into context as <relevant-memories> block
+  - Tools: memory_recall, memory_store, memory_forget
+
+  What it's missing to replace memory files
+
+  1. No file writing — LanceDB stores opaque vector entries, not readable
+  markdown. The agent can't browse, edit, or organize memories like it can with
+  MEMORY.md and memory/*.md.
+  2. No integration with core memory_search/memory_get — these tools always go
+  through MemoryIndexManager or QmdMemoryManager. LanceDB registers separate
+  tools (memory_recall/memory_store) that the core system doesn't know about.
+  3. No pre-compaction flush — the automatic memory flush before context
+  compaction writes to markdown files. LanceDB has no hook for this.
+  4. Capture is rule-based and limited — only captures messages matching regex
+  triggers (max 500 chars, max 3 per conversation, user messages only). The
+  markdown approach lets the agent decide what to store and write arbitrarily
+  detailed notes.
+  5. No daily logs — no equivalent of memory/YYYY-MM-DD.md append-only daily
+  logs.
+  6. No human-readable audit trail — LanceDB entries are vector DB rows, not
+  files you can open and read.
+
+  In practice
+
+  LanceDB is a supplementary layer — it adds passive auto-recall/auto-capture
+  alongside the markdown memory system. The markdown files remain the primary,
+  agent-writable, human-readable memory store.
+
+❯ then how to choose between qmd and lanceDB 
+
+⏺ They're not competing — they solve different problems and can run
+  simultaneously.
+
+  QMD = better search engine over your existing memory files
+
+  - Replaces the builtin SQLite indexer for memory_search/memory_get
+  - Indexes the same MEMORY.md + memory/*.md markdown files
+  - Adds BM25 + vector + reranking (vs builtin's hybrid FTS+vector)
+  - Runs fully local (no API cost for embeddings)
+  - The agent still writes memory to markdown — QMD just retrieves it better
+
+  LanceDB = passive memory layer that works automatically
+
+  - Separate vector DB alongside everything else
+  - Auto-captures facts from user messages without the agent doing anything
+  - Auto-recalls relevant memories into context before each turn
+  - The agent doesn't need to call any tool — it happens via lifecycle hooks
+  - Useful for "I told you my email last week" type recall
+
+  Decision guide
+
+  Scenario: You want better recall from existing memory files
+  Use: QMD
+  ────────────────────────────────────────
+  Scenario: You want zero-cost local embeddings
+  Use: QMD
+  ────────────────────────────────────────
+  Scenario: You want the agent to passively remember things without being asked
+  Use: LanceDB
+  ────────────────────────────────────────
+  Scenario: You want both better search + passive capture
+  Use: Both together
+  ────────────────────────────────────────
+  Scenario: You have a small memory footprint and the builtin works fine
+  Use: Neither
+
+  Running both
+
+  {
+    // QMD replaces the search engine
+    memory: {
+      backend: "qmd",
+      qmd: { /* ... */ }
+    },
+    // LanceDB runs as a plugin alongside
+    plugins: {
+      "memory-lancedb": {
+        embedding: { apiKey: "${OPENAI_API_KEY}" },
+        autoRecall: true,
+        autoCapture: true
+      }
+    }
+  }
+
+  When both are active:
+  - memory_search / memory_get → routed through QMD
+  - memory_recall / memory_store / memory_forget → routed through LanceDB
+  - Auto-recall injects LanceDB hits into context before each turn
+  - The agent writes markdown files as usual; QMD indexes them; LanceDB captures
+   facts separately
+
+  They don't conflict because they operate on different data stores, register
+  different tools, and hook into different parts of the pipeline.
+
+❯ without LanceDB, memory_recall/store/forget is implemented in the default 
+   settings?                                                                
+
+⏺ Searched for 1 pattern (ctrl+o to expand)
+
+⏺ No. memory_recall, memory_store, and memory_forget only exist in the LanceDB
+  plugin. Without it, the only memory tools available are:
+
+  - memory_search — semantic search over markdown files (builtin or QMD)
+  - memory_get — read a specific markdown file/line range
+
+  Without LanceDB, there's no passive auto-capture, no auto-recall injection,
+  and no structured store/forget. The agent remembers things by explicitly
+  writing to MEMORY.md or memory/*.md files, and recalls by calling
+  memory_search.
+
+❯ qmd, lanceDB works on both memory and session history? 
+
+⏺ Column 1: Builtin (MemoryIndexManager)
+  Memory files (MEMORY.md, memory/*.md): Yes (default)
+  Session history (sessions/*.jsonl): Opt-in: experimental.sessionMemory: true +
+
+    sources: ["memory", "sessions"]
+  ────────────────────────────────────────
+  Column 1: QMD
+  Memory files (MEMORY.md, memory/*.md): Yes (default)
+  Session history (sessions/*.jsonl): Opt-in: memory.qmd.sessions.enabled: true
+  —
+    exports JSONL → markdown, then indexes those
+  ────────────────────────────────────────
+  Column 1: LanceDB
+  Memory files (MEMORY.md, memory/*.md): No — has its own separate vector DB
+  Session history (sessions/*.jsonl): No — only captures from live conversation
+    messages via hooks
+
+  So:
+
+  - Builtin and QMD both can index sessions, but it's off by default for both.
+  They index the same source files, just with different engines.
+  - LanceDB doesn't touch either memory files or session files. It only captures
+   snippets from live user messages during a conversation (auto-capture hook)
+  and stores them in its own LanceDB database. It has no awareness of the
+  markdown or JSONL files on disk.
+
+❯ which one is the latest addition to the codebase, qmd or lancedb? 
+
+⏺ Bash(git log --oneline --diff-filter=A -- extensions/memory-lancedb/index.ts |
+       tail -1)
+  ⎿  bf925e575 chore: rename memory-lancedb extension folder
+
+⏺ Bash(git log --oneline --diff-filter=A -- src/memory/qmd-manager.ts | tail -1)
+  ⎿  5d3af3bc6 feat (memory): Implement new (opt-in) QMD memory backend
+
+⏺ Bash(git log -1 --format="%ai" bf925e575 && git log -1 --format="%ai"
+      5d3af3bc6)
+  ⎿  2026-01-18 22:27:15 +0000
+     2026-01-27 21:57:15 -0800
+
+⏺ QMD is newer.
+
+  - LanceDB: Jan 18, 2026
+  - QMD: Jan 27, 2026 (9 days later)

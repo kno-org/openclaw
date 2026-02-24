@@ -1,0 +1,162 @@
+
+ ▐▛███▜▌   Claude Code v2.1.50
+▝▜█████▛▘  Opus 4.6 · Claude Max
+  ▘▘ ▝▝    ~/projects/openclaw
+
+❯ /clear 
+  ⎿  (no content)
+
+❯ the heartbeat tends to loop in error situation and waste lots of token    
+  before, any improvement in the current codebase?                          
+
+⏺ Let me investigate the current heartbeat implementation to assess the
+  situation.
+
+⏺ Explore(Investigate heartbeat token waste) Sonnet 4.6
+  ⎿  Done (35 tool uses · 123.9k tokens · 2m 54s)
+  (ctrl+o to expand)
+
+⏺ The codebase has extensive safeguards against heartbeat token waste now.
+  Here's a summary of what's in place:
+
+  Current Safeguards
+
+  Pre-LLM-call gates (zero tokens spent)
+
+  - Empty HEARTBEAT.md — skipped entirely if file has only whitespace/headers
+  - All output disabled — skipped if showOk, showAlerts, and useIndicator are
+  all false
+  - Queue busy — skipped if the main command lane has in-flight requests
+  (retries after 1s)
+  - Active hours — skipped if outside configured time windows
+  - Channel not ready — skipped if channel isn't linked/connected
+
+  Post-LLM-call token conservation
+
+  - Transcript pruning — when the LLM replies HEARTBEAT_OK, the transcript is
+  truncated back to pre-heartbeat size, preventing OK turns from accumulating in
+   context and inflating future prompts
+  - updatedAt restoration — HEARTBEAT_OK runs don't keep sessions alive (avoids
+  delaying idle expiry)
+  - Duplicate suppression — same alert text within 24h is suppressed and
+  transcript pruned
+  - ackMaxChars limit — small acknowledgment noise (up to 300 chars) is
+  swallowed
+
+  Anti-loop / anti-spin
+
+  - Wake scheduler running flag — prevents concurrent heartbeat invocations
+  - 1s retry cooldown — errors and busy-skips retry after 1000ms, not
+  immediately
+  - Retry is a hard minimum — new requests can't preempt the cooldown timer
+  - Stale handler generation guard — prevents old lifecycle disposers from
+  interfering
+  - Cron busy-poll max 2min — cron-triggered heartbeats give up after 2 minutes
+  and fall back to async
+  - Single transient HTTP retry — only one automatic retry on 502/521, not a
+  loop
+  - Context overflow → session reset — no retry loop on overflow
+
+  Potential remaining gaps
+
+  1. No circuit-breaker on repeated LLM failures — if the LLM consistently
+  errors (auth failure, model not found), heartbeats will keep firing at the
+  normal interval (default 30m) with only a 1s retry delay. There's no
+  escalating backoff or "stop after N consecutive failures" logic.
+  2. Duplicate suppression is exact-text-match only — if the LLM generates
+  slightly different wording for the same underlying alert each run, tokens are
+  consumed without dedup kicking in.
+
+  These are relatively minor compared to the historical situation. The
+  transcript pruning alone is a major improvement — previously, HEARTBEAT_OK
+  turns would accumulate in context, steadily inflating prompt token counts on
+  every future call.
+
+  Want me to address either of those remaining gaps?
+
+✻ Baked for 3m 22s
+
+❯ tell me about the previous issues 
+
+⏺ Bash(Find heartbeat fix history)
+  ⎿  Done (7 tool uses · 21.9k tokens · 50s)
+  (ctrl+o to expand)
+
+⏺ Here's the history of heartbeat problems and how they were addressed:
+
+  Historical Issues
+
+  1. HEARTBEAT_OK Token Leaking & Accumulating (biggest problem, ~13 fixes)
+
+  The most persistent issue. The LLM replies HEARTBEAT_OK when nothing needs
+  attention, but this token caused problems in many ways:
+
+  - Leaked to users — stray HEARTBEAT_OK replies were delivered to messaging
+  channels (06e379a23)
+  - Accumulated in transcripts — OK turns piled up in session transcripts,
+  inflating the context window on every future call, steadily burning more
+  tokens (e9f2e6a82 was the key fix: transcript pruning)
+  - Duplicated/mangled — the token got duplicated (56245d564), wrapped in markup
+   (4181e7297), or interfered with by responsePrefix (f476c8b48, 3518554e2)
+  - Fuzzy matching needed — different models returned variations like
+  **HEARTBEAT_OK** or with stray punctuation, requiring progressively more
+  flexible stripping (f9379ecee)
+  - Cron jobs delivered it — cron-triggered heartbeats forwarded the OK ack to
+  channels (dae7f560a)
+  - TUI noise — OK tokens showed up as chat events in the control UI (222784098)
+
+  2. Scheduler Silent Deaths (~4 crash fixes)
+
+  The heartbeat scheduler was fragile and would silently stop running:
+
+  - Unhandled exception killed the timer — if runOnce threw, the scheduler died
+  permanently (5147656d6)
+  - Race condition in wake handler — concurrent wake + scheduled runs caused a
+  deadlock that killed the scheduler (40aff672c)
+  - Unhandled rejection crash — another crash path in the wake handler
+  (82746973d)
+  - Cron wake race — wakeMode: "now" from cron didn't wait for completion,
+  causing races (91c870a0c)
+
+  3. Wrong Routing / Delivery (~7 fixes)
+
+  Heartbeat responses went to the wrong place:
+
+  - Wrong Telegram chat/topic — heartbeats landed in wrong chat instead of
+  target topic (d833dcd73)
+  - Missing accountId — Telegram delivery failed without accountId (9d42972b8)
+  - Wrong agent for cron jobs — main-session cron jobs used the wrong agentId
+  (04e3a66f9)
+  - Ghost reminders — phantom notifications delivered when they shouldn't be
+  (4f687a744)
+  - Fired on inactive channels — WhatsApp heartbeats ran when the provider was
+  inactive (3a485a14a)
+
+  4. HEARTBEAT.md Existence Flip-flopping (4 commits including a revert)
+
+  The codebase went back and forth on whether heartbeat should run without a
+  HEARTBEAT.md file — skip it, don't auto-create it, revert that, skip again,
+  then finally allow running without it.
+
+  5. Config Overrides Ignored (2 fixes)
+
+  The heartbeat.model config was ignored — heartbeats used the session model
+  instead, requiring two separate fixes (4200782a5, 6d723c9f8).
+
+  ---
+  The Token Waste Loop You Recall
+
+  The most likely issue you're remembering: HEARTBEAT_OK turns accumulated in 
+  the transcript. Every 30-minute heartbeat that returned OK added a full
+  round-trip (system prompt + user prompt + assistant reply) to the session
+  transcript. Over hours/days, this meant:
+
+  1. Each subsequent heartbeat call sent an ever-growing prompt (all previous OK
+   turns in context)
+  2. Token usage grew linearly with uptime
+  3. Eventually hit context limits, triggering compaction or session resets
+
+  The fix (e9f2e6a82) truncates the transcript back to its pre-heartbeat size
+  whenever HEARTBEAT_OK is returned, so OK turns never accumulate.
+
+✻ Crunched for 1m 22s
